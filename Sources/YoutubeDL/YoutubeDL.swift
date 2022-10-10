@@ -24,8 +24,8 @@ import Foundation
 import PythonKit
 import PythonSupport
 import AVFoundation
-import Photos
-import UIKit
+
+public typealias TimeRange = Range<TimeInterval>
 
 // https://github.com/pvieito/PythonKit/pull/30#issuecomment-751132191
 let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
@@ -210,9 +210,7 @@ open class YoutubeDL: NSObject {
         }
         return directory.appendingPathComponent("yt_dlp")
     }()
-    
-    open var transcoder: Transcoder?
-    
+        
     public var version: String?
     
     public lazy var downloader = Downloader.shared
@@ -236,51 +234,8 @@ open class YoutubeDL: NSObject {
     var finishedContinuation: AsyncStream<URL>.Continuation?
     
     var keepIntermediates = false
-    
-    lazy var postDownloadTask = Task {
-        for await (url, kind) in downloader.stream {
-            print(#function, kind, url.lastPathComponent)
-            
-            switch kind {
-            case .complete:
-                export(url)
-            case .videoOnly, .audioOnly:
-                let directory = url.deletingLastPathComponent()
-                guard let download = pendingDownloads.first(where: { $0.directory.path == directory.path }) else {
-                    print(#function, "no download with", directory, pendingDownloads.map(\.directory))
-                    return
-                }
-                guard tryMerge(directory: directory, title: url.title, timeRange: download.timeRange) else { return }
-                finishedContinuation?.yield(url)
-            case .otherVideo:
-                do {
-                    try await transcode(directory: url.deletingLastPathComponent())
-                    finishedContinuation?.yield(url)
-                } catch {
-                    print(error)
-                }
-            }
-        }
-    }
-    
-    lazy var pendingDownloads: [Download] = {
-        loadPendingDownloads()
-    }() {
-        didSet { savePendingDownloads() }
-    }
-    
-    var pendingDownloadsURL: URL { downloadsDirectory.appendingPathComponent("PendingDownloads.json") }
-    
-    public var pendingTranscode: URL? {
-        pendingDownloads.first { $0.transcodePending }?.directory
-    }
-    
-    public override init() {
-        super.init()
         
-        _ = postDownloadTask
-    }
-    
+
     func loadPythonModule(downloadPythonModule: Bool = true) async throws -> PythonObject {
         if Py_IsInitialized() == 0 {
             PythonSupport.initialize()
@@ -339,75 +294,6 @@ open class YoutubeDL: NSObject {
         return pythonObject!
     }
         
-    public typealias FormatSelector = (Info) async -> ([Format], URL?, TimeRange?, Double?, String)
-    
-    open func download(url: URL, options: Options = [.background, .chunked], formatSelector: FormatSelector? = nil) async throws -> URL {
-        var (formats, info) = try await extractInfo(url: url)
-        
-        var directory: URL?
-        var timeRange: Range<TimeInterval>?
-        let bitRate: Double?
-        let title: String
-        if let formatSelector = formatSelector {
-            (formats, directory, timeRange, bitRate, title) = await formatSelector(info)
-            guard !formats.isEmpty else { throw YoutubeDLError.canceled }
-        } else {
-            bitRate = formats[0].vbr
-            title = info.safeTitle
-        }
-        
-        pendingDownloads.append(Download(formats: [],
-                                         directory: directory ?? downloadsDirectory,
-                                         safeTitle: title,
-                                         options: options,
-                                         timeRange: timeRange,
-                                         bitRate: bitRate,
-                                         transcodePending: false))
-        
-        await downloader.session.allTasks.forEach { $0.cancel() }
-        
-        for format in formats {
-            try download(format: format, resume: !downloader.isDownloading || isTest, chunked: options.contains(.chunked), directory: directory ?? downloadsDirectory, title: info.safeTitle)
-        }
-        
-        for await url in finished {
-            // FIXME: validate url
-            return url
-        }
-        fatalError()
-    }
-    
-    func savePendingDownloads() {
-        do {
-            try JSONEncoder().encode(pendingDownloads).write(to: pendingDownloadsURL)
-        } catch {
-            print(#function, error)
-        }
-    }
-    
-    func loadPendingDownloads() -> [Download] {
-        do {
-            return try JSONDecoder().decode([Download].self,
-                                            from: try Data(contentsOf: pendingDownloadsURL))
-        } catch {
-            print(#function, error)
-            return []
-        }
-    }
-    
-    func processPendingDownload() {
-        guard let index = pendingDownloads.firstIndex(where: { !$0.formats.isEmpty }) else {
-            return
-        }
-
-        let format = pendingDownloads[index].formats.remove(at: 0)
-        
-        Task {
-            let download = pendingDownloads[index]
-            try self.download(format: format, resume: true, chunked: download.options.contains(.chunked), directory: download.directory, title: download.safeTitle)
-        }
-    }
-    
     func makeURL(directory: URL? = nil, title: String, kind: Kind, ext: String) -> URL {
         (directory ?? downloadsDirectory).appendingPathComponent(
             title
@@ -415,54 +301,7 @@ open class YoutubeDL: NSObject {
                 .appending(kind.rawValue))
             .appendingPathExtension(ext)
     }
-    
-    open func download(format: Format, resume: Bool, chunked: Bool, directory: URL, title: String) throws {
-        let kind: Kind = format.isVideoOnly
-        ? (!format.isTranscodingNeeded ? .videoOnly : .otherVideo)
-        : (format.isAudioOnly ? .audioOnly : .complete)
-        
-        func download(for request: URLRequest, resume: Bool) throws {
-            let progress: Progress? = downloader.progress
-            progress?.kind = .file
-            progress?.fileOperationKind = .downloading
-            let url = makeURL(directory: directory, title: title, kind: kind, ext: format.ext)
-            do {
-                try Data().write(to: url)
-            }
-            catch {
-                print(#function, error)
-            }
-            progress?.fileURL = url
-            
-            removeItem(at: url)
-
-            let task = downloader.download(request: request, url: url, resume: resume)
-            
-            if task.hasPrefix(0) {
-                guard FileManager.default.createFile(atPath: url.appendingPathExtension("part").path, contents: nil) else { fatalError() }
-            }
-            
-            print(#function, "start download:", task.info)
-        }
-        
-        if chunked, let size = format.filesize {
-            guard var request = format.urlRequest else { fatalError() }
-            var start: Int64 = 0
-            while start < size {
-                // https://github.com/ytdl-org/youtube-dl/issues/15271#issuecomment-362834889
-                let end = request.setRange(start: start, fullSize: Int64(size))
-//                print(#function, "first chunked size:", end + 1)
-                
-                try download(for: request, resume: resume && start == 0)
-                start = end + 1
-            }
-        } else {
-            guard let request = format.urlRequest else { fatalError() }
-            
-            try download(for: request, resume: resume)
-        }
-    }
-   
+       
     open func extractInfo(url: URL) async throws -> ([Format], Info) {
         let pythonObject: PythonObject
         if let _pythonObject = self.pythonObject {
@@ -487,191 +326,7 @@ open class YoutubeDL: NSObject {
         return (formats, try decoder.decode(Info.self, from: info))
     }
     
-    func tryMerge(directory: URL, title: String, timeRange: TimeRange?) -> Bool {
-        let t0 = ProcessInfo.processInfo.systemUptime
-       
-        let videoURL = makeURL(directory: directory, title: title, kind: .videoOnly, ext: "mp4")
-        let audioURL: URL = makeURL(directory: directory, title: title, kind: .audioOnly, ext: "m4a")
-        let videoAsset = AVAsset(url: videoURL)
-        let audioAsset = AVAsset(url: audioURL)
-        
-        guard let videoAssetTrack = videoAsset.tracks(withMediaType: .video).first,
-              let audioAssetTrack = audioAsset.tracks(withMediaType: .audio).first else {
-            print(#function,
-                  videoAsset.tracks(withMediaType: .video),
-                  audioAsset.tracks(withMediaType: .audio))
-            return false
-        }
-        
-        let composition = AVMutableComposition()
-        let videoCompositionTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
-        let audioCompositionTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-        
-        do {
-            try videoCompositionTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: videoAssetTrack.timeRange.duration), of: videoAssetTrack, at: .zero)
-            let range: CMTimeRange
-            if let timeRange = timeRange {
-                range = CMTimeRange(start: CMTime(seconds: timeRange.lowerBound, preferredTimescale: 1),
-                                    end: CMTime(seconds: timeRange.upperBound, preferredTimescale: 1))
-            } else {
-                range = CMTimeRange(start: .zero, duration: audioAssetTrack.timeRange.duration)
-            }
-            try audioCompositionTrack?.insertTimeRange(range, of: audioAssetTrack, at: .zero)
-            print(#function, videoAssetTrack.timeRange, range)
-        }
-        catch {
-            print(#function, error)
-            return false
-        }
-        
-        guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough) else {
-            print(#function, "unable to init export session")
-            return false
-        }
-        let outputURL = directory.appendingPathComponent(title).appendingPathExtension("mp4")
-        
-        removeItem(at: outputURL)
-        
-        session.outputURL = outputURL
-        session.outputFileType = .mp4
-        print(#function, "merging...")
-        
-        DispatchQueue.main.async {
-            let progress = self.downloader.progress
-            progress.kind = nil
-            progress.localizedDescription = NSLocalizedString("Merging...", comment: "Progress description")
-            progress.localizedAdditionalDescription = nil
-            progress.totalUnitCount = 0
-            progress.completedUnitCount = 0
-            progress.estimatedTimeRemaining = nil
-        }
-        
-        session.exportAsynchronously {
-            print(#function, "finished merge", session.status.rawValue)
-            print(#function, "took", self.downloader.dateComponentsFormatter.string(from: ProcessInfo.processInfo.systemUptime - t0) ?? "?")
-            if session.status == .completed {
-                if !self.keepIntermediates {
-                    removeItem(at: videoURL)
-                    removeItem(at: audioURL)
-                }
-                
-                self.export(outputURL)
-            } else {
-                print(#function, session.error ?? "no error?")
-            }
-        }
-        return true
-    }
-    
-    open func transcode(directory: URL) async throws {
-        guard let download = pendingDownloads.first(where: { $0.directory.path == directory.path }) else {
-            print(#function, "no download with", directory, pendingDownloads.map(\.directory))
-            return
-        }
-        
-        DispatchQueue.main.async {
-            guard UIApplication.shared.applicationState == .active else {
-                guard let index = self.pendingDownloads.firstIndex(where: { $0.directory.path == directory.path }) else { fatalError() }
-                self.pendingDownloads[index].transcodePending = true
-                
-                notify(body: NSLocalizedString("AskTranscode", comment: "Notification body"), identifier: NotificationRequestIdentifier.transcode.rawValue)
-                return
-            }
-            
-            //            let alert = UIAlertController(title: nil, message: NSLocalizedString("DoNotSwitch", comment: "Alert message"), preferredStyle: .alert)
-            //            alert.addAction(UIAlertAction(title: NSLocalizedString("OK", comment: "Action"), style: .default, handler: nil))
-            //            self.topViewController?.present(alert, animated: true, completion: nil)
-        }
-        
-        let url = makeURL(directory: directory, title: download.safeTitle, kind: .otherVideo, ext: "webm") // FIXME: ext
-        let outURL = makeURL(directory: directory, title: download.safeTitle, kind: .videoOnly, ext: "mp4")
-        
-        removeItem(at: outURL)
-        
-        DispatchQueue.main.async {
-            let progress = self.downloader.progress
-            progress.kind = nil
-            progress.localizedDescription = NSLocalizedString("Transcoding...", comment: "Progress description")
-            progress.totalUnitCount = 100
-        }
-        
-        let t0 = ProcessInfo.processInfo.systemUptime
-        
-        if transcoder == nil {
-            transcoder = Transcoder()
-        }
-        
-        transcoder?.progressBlock = { progress in
-            print(#function, "progress:", progress)
-            let elapsed = ProcessInfo.processInfo.systemUptime - t0
-            let speed = progress / elapsed
-            let ETA = (1 - progress) / speed
-            
-            guard ETA.isFinite else { return }
-            
-            DispatchQueue.main.async {
-                let _progress = self.downloader.progress
-                _progress.completedUnitCount = Int64(progress * 100)
-                _progress.estimatedTimeRemaining = ETA
-            }
-        }
-        
-        defer {
-            transcoder = nil
-        }
-        
-        try transcoder?.transcode(from: url, to: outURL, timeRange: download.timeRange, bitRate: download.bitRate)
-        
-        print(#function, "took", downloader.dateComponentsFormatter.string(from: ProcessInfo.processInfo.systemUptime - t0) ?? "?")
-        
-        if !keepIntermediates {
-            removeItem(at: url)
-        }
-        
-        notify(body: NSLocalizedString("FinishedTranscoding", comment: "Notification body"))
-        
-        tryMerge(directory: url.deletingLastPathComponent(), title: url.title, timeRange: download.timeRange)
-    }
-    
-    internal func export(_ url: URL) {
-        DispatchQueue.main.async {
-            let progress = self.downloader.progress
-            progress.localizedDescription = nil
-            progress.localizedAdditionalDescription = nil
-            progress.kind = .file
-            progress.fileOperationKind = .copying
-            progress.fileURL = url
-            progress.completedUnitCount = 0
-            progress.estimatedTimeRemaining = nil
-            progress.throughput = nil
-            progress.fileTotalCount = 1
-        }
-        
-        PHPhotoLibrary.shared().performChanges({
-            _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            //                            changeRequest.contentEditingOutput = output
-        }) { (success, error) in
-            print(#function, success, error ?? "")
-            
-            if let continuation = self.finishedContinuation {
-                continuation.yield(url)
-            } else {
-                notify(body: NSLocalizedString("Download complete!", comment: "Notification body"))
-            }
-            DispatchQueue.main.async {
-                let progress = self.downloader.progress
-                progress.fileCompletedCount = 1
-                do {
-                    let attributes = try FileManager.default.attributesOfItem(atPath: url.path) as NSDictionary
-                    progress.completedUnitCount = Int64(attributes.fileSize())
-                }
-                catch {
-                    progress.localizedDescription = error.localizedDescription
-                }
-            }
-        }
-    }
-        
+  
     fileprivate static func movePythonModule(_ location: URL) throws {
         removeItem(at: pythonModuleURL)
         
@@ -724,7 +379,7 @@ public extension Format {
     
     var isTranscodingNeeded: Bool {
         self.ext == "mp4"
-            ? (self.vcodec ?? "").hasPrefix(av1CodecPrefix)
+        ? (self.vcodec).hasPrefix(av1CodecPrefix)
             : self.ext != "m4a"
     }
 }
