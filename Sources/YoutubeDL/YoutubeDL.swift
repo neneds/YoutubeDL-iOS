@@ -260,7 +260,7 @@ open class YoutubeDL: NSObject {
         return pythonModule
     }
     
-    func injectFakePopen() {
+    private func injectFakePopen() {
         runSimpleString("""
             class Pop:
                 def __init__(self, args, bufsize=-1, executable=None,
@@ -287,21 +287,13 @@ open class YoutubeDL: NSObject {
             """)
     }
     
-    func makePythonObject(_ options: PythonObject? = nil, initializePython: Bool = true) async throws -> PythonObject {
+    private func makePythonObject(_ options: PythonObject? = nil, initializePython: Bool = true) async throws -> PythonObject {
         let pythonModule = try await loadPythonModule()
         pythonObject = pythonModule.YoutubeDL(options ?? defaultOptions)
-        self.options = options
+        self.options = options ?? defaultOptions
         return pythonObject!
     }
         
-    func makeURL(directory: URL? = nil, title: String, kind: Kind, ext: String) -> URL {
-        (directory ?? downloadsDirectory).appendingPathComponent(
-            title
-                .appending(Kind.separator)
-                .appending(kind.rawValue))
-            .appendingPathExtension(ext)
-    }
-       
     open func extractInfo(url: URL) async throws -> ([Format], Info) {
         let pythonObject: PythonObject
         if let _pythonObject = self.pythonObject {
