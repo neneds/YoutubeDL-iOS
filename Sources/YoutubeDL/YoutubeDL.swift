@@ -143,7 +143,7 @@ public extension Format {
 }
 
 public let defaultOptions: PythonObject = [
-    "format": "best,worst",
+    "format": "best,best[height<=720],best[height<=480]",
     "nocheckcertificate": true,
     "verbose": true,
 ]
