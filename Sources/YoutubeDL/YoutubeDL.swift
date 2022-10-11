@@ -143,7 +143,7 @@ public extension Format {
 }
 
 public let defaultOptions: PythonObject = [
-    "format": "bestvideo,bestaudio[ext=m4a]",
+    "format": "best,worst",
     "nocheckcertificate": true,
     "verbose": true,
 ]
